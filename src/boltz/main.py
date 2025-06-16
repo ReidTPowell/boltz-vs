@@ -1288,7 +1288,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
 def _screen_worker(data_dir: Path, out_dir: str, device: str) -> None:
     """Run prediction for a subset of inputs on a single GPU."""
     os.environ["CUDA_VISIBLE_DEVICES"] = str(device)
-    predict(
+    predict.callback(
         data=str(data_dir),
         out_dir=out_dir,
         devices=1,
