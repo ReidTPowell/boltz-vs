@@ -1259,7 +1259,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             "write_full_pde": False,
         }
 
-        # Load affinity model
+    predict.callback(
         if affinity_checkpoint is None:
             affinity_checkpoint = cache / "boltz2_aff.ckpt"
 
