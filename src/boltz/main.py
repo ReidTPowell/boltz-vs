@@ -5,11 +5,17 @@ import platform
 import tarfile
 import urllib.request
 import warnings
+import json
 from dataclasses import asdict, dataclass
 from functools import partial
 from multiprocessing import Pool
 from pathlib import Path
 from typing import Literal, Optional
+import tempfile
+import string
+
+import pandas as pd
+import yaml
 
 import click
 import torch
@@ -1265,6 +1271,107 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             datamodule=data_module,
             return_predictions=False,
         )
+
+
+def _screen_worker(data_dir: Path, out_dir: str, device: str) -> None:
+    """Run prediction for a subset of inputs on a single GPU."""
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(device)
+    predict(
+        data=str(data_dir),
+        out_dir=out_dir,
+        devices=1,
+        accelerator="gpu",
+    )
+
+
+@cli.command()
+@click.argument("csv_file", type=click.Path(exists=True))
+@click.option("-o", "--out_dir", type=click.Path(exists=False), default="./")
+@click.option(
+    "--inference-device",
+    default="0",
+    help="Comma separated list of GPU device indices to use for inference.",
+)
+def screen(csv_file: str, out_dir: str, inference_device: str) -> None:
+    """Run virtual screening from a CSV description."""
+    df = pd.read_csv(csv_file)
+
+    tmp_root = Path(tempfile.mkdtemp(prefix="boltz_screen_"))
+    yaml_paths: list[Path] = []
+
+    for _, row in df.iterrows():
+        name = str(row["complex_name"])
+
+        if isinstance(row.get("protein_path"), str) and row["protein_path"]:
+            with open(Path(row["protein_path"]).expanduser(), "r") as f:
+                config = yaml.safe_load(f)
+        else:
+            seq = str(row["protein_sequence"])
+            config = {
+                "version": 1,
+                "sequences": [{"protein": {"id": "A", "sequence": seq}}],
+            }
+
+        seqs = config.get("sequences", [])
+        used_ids: list[str] = []
+        for item in seqs:
+            key = next(iter(item.keys()))
+            cid = item[key]["id"]
+            if isinstance(cid, list):
+                used_ids.extend(cid)
+            else:
+                used_ids.append(cid)
+
+        ligand_id = next(
+            l for l in string.ascii_uppercase if l not in used_ids
+        )
+
+        seqs.append({"ligand": {"id": ligand_id, "smiles": row["ligand_description"]}})
+        config["sequences"] = seqs
+        properties = config.get("properties", [])
+        properties.append({"affinity": {"binder": ligand_id}})
+        config["properties"] = properties
+
+        path = tmp_root / f"{name}.yaml"
+        with path.open("w") as f:
+            yaml.safe_dump(config, f, sort_keys=False)
+        yaml_paths.append(path)
+
+    devices = [d.strip() for d in str(inference_device).split(",") if d.strip()]
+    groups = [[] for _ in devices]
+    for idx, path in enumerate(yaml_paths):
+        groups[idx % len(devices)].append(path)
+
+    procs = []
+    for device, group in zip(devices, groups):
+        if not group:
+            continue
+        data_dir = tmp_root / f"gpu_{device}"
+        data_dir.mkdir()
+        for p in group:
+            (data_dir / p.name).symlink_to(p)
+        proc = multiprocessing.Process(
+            target=_screen_worker, args=(data_dir, out_dir, device)
+        )
+        proc.start()
+        procs.append(proc)
+
+    for p in procs:
+        p.join()
+
+    results = []
+    out_path = Path(out_dir)
+    for json_file in out_path.glob("boltz_results_*/predictions/*/affinity_*.json"):
+        with json_file.open("r") as f:
+            data = json.load(f)
+        complex_name = json_file.parent.name
+        results.append({"complex_name": complex_name, **data})
+
+    if results:
+        df_out = pd.DataFrame(results)
+        df_out.to_csv(out_path / "screening_results.csv", index=False)
+
+    return
 
 
 if __name__ == "__main__":
