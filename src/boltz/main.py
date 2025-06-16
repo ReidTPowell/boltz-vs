@@ -5,11 +5,19 @@ import platform
 import tarfile
 import urllib.request
 import warnings
+import json
+import hashlib
 from dataclasses import asdict, dataclass
 from functools import partial
 from multiprocessing import Pool
 from pathlib import Path
 from typing import Literal, Optional
+from collections import OrderedDict
+import tempfile
+import string
+
+import pandas as pd
+import yaml
 
 import click
 import torch
@@ -511,17 +519,22 @@ def process_input(  # noqa: C901, PLR0912, PLR0915, D103
         target_id = target.record.id
 
         # Get all MSA ids and decide whether to generate MSA
-        to_generate = {}
+        to_generate: OrderedDict[str, str] = OrderedDict()
         prot_id = const.chain_type_ids["PROTEIN"]
+        seq_key_parts = [
+            target.sequences[c.entity_id]
+            for c in target.record.chains
+            if c.mol_type == prot_id
+        ]
+        seq_key = hashlib.md5("".join(seq_key_parts).encode()).hexdigest()
         for chain in target.record.chains:
-            # Add to generate list, assigning entity id
             if (chain.mol_type == prot_id) and (chain.msa_id == 0):
-                entity_id = chain.entity_id
-                msa_id = f"{target_id}_{entity_id}"
-                to_generate[msa_id] = target.sequences[entity_id]
-                chain.msa_id = msa_dir / f"{msa_id}.csv"
-
-            # We do not support msa generation for non-protein chains
+                seq = target.sequences[chain.entity_id]
+                name = f"{seq_key}_{hashlib.md5(seq.encode()).hexdigest()}"
+                msa_path = msa_dir / f"{name}.csv"
+                chain.msa_id = msa_path
+                if not msa_path.exists():
+                    to_generate[name] = seq
             elif chain.msa_id == 0:
                 chain.msa_id = -1
 
@@ -535,7 +548,7 @@ def process_input(  # noqa: C901, PLR0912, PLR0915, D103
             click.echo(msg)
             compute_msa(
                 data=to_generate,
-                target_id=target_id,
+                target_id=seq_key,
                 msa_dir=msa_dir,
                 msa_server_url=msa_server_url,
                 msa_pairing_strategy=msa_pairing_strategy,
@@ -552,8 +565,8 @@ def process_input(  # noqa: C901, PLR0912, PLR0915, D103
                 raise FileNotFoundError(msg)  # noqa: TRY301
 
             # Dump processed MSA
-            processed = processed_msa_dir / f"{target_id}_{msa_idx}.npz"
-            msa_id_map[msa_id] = f"{target_id}_{msa_idx}"
+            processed = processed_msa_dir / f"{seq_key}_{msa_idx}.npz"
+            msa_id_map[msa_id] = f"{seq_key}_{msa_idx}"
             if not processed.exists():
                 # Parse A3M
                 if msa_path.suffix == ".a3m":
@@ -614,7 +627,7 @@ def process_inputs(
     msa_server_url: str,
     msa_pairing_strategy: str,
     max_msa_seqs: int = 8192,
-    use_msa_server: bool = False,
+    use_msa_server: bool = True,
     boltz2: bool = False,
     preprocessing_threads: int = 1,
 ) -> Manifest:
@@ -631,7 +644,7 @@ def process_inputs(
     max_msa_seqs : int, optional
         Max number of MSA sequences, by default 4096.
     use_msa_server : bool, optional
-        Whether to use the MMSeqs2 server for MSA generation, by default False.
+        Whether to use the MMSeqs2 server for MSA generation, by default True.
     boltz2: bool, optional
         Whether to use Boltz2, by default False.
     preprocessing_threads: int, optional
@@ -840,9 +853,10 @@ def cli() -> None:
     default=None,
 )
 @click.option(
-    "--use_msa_server",
+    "--use_msa_server/--no_use_msa_server",
+    default=True,
     is_flag=True,
-    help="Whether to use the MMSeqs2 server for MSA generation. Default is False.",
+    help="Whether to use the MMSeqs2 server for MSA generation. Default is True.",
 )
 @click.option(
     "--msa_server_url",
@@ -949,7 +963,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     num_workers: int = 2,
     override: bool = False,
     seed: Optional[int] = None,
-    use_msa_server: bool = False,
+    use_msa_server: bool = True,
     msa_server_url: str = "https://api.colabfold.com",
     msa_pairing_strategy: str = "greedy",
     use_potentials: bool = False,
@@ -1265,6 +1279,107 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             datamodule=data_module,
             return_predictions=False,
         )
+
+
+def _screen_worker(data_dir: Path, out_dir: str, device: str) -> None:
+    """Run prediction for a subset of inputs on a single GPU."""
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(device)
+    predict(
+        data=str(data_dir),
+        out_dir=out_dir,
+        devices=1,
+        accelerator="gpu",
+    )
+
+
+@cli.command()
+@click.argument("csv_file", type=click.Path(exists=True))
+@click.option("-o", "--out_dir", type=click.Path(exists=False), default="./")
+@click.option(
+    "--inference-device",
+    default="0",
+    help="Comma separated list of GPU device indices to use for inference.",
+)
+def screen(csv_file: str, out_dir: str, inference_device: str) -> None:
+    """Run virtual screening from a CSV description."""
+    df = pd.read_csv(csv_file)
+
+    tmp_root = Path(tempfile.mkdtemp(prefix="boltz_screen_"))
+    yaml_paths: list[Path] = []
+
+    for _, row in df.iterrows():
+        name = str(row["complex_name"])
+
+        if isinstance(row.get("protein_path"), str) and row["protein_path"]:
+            with open(Path(row["protein_path"]).expanduser(), "r") as f:
+                config = yaml.safe_load(f)
+        else:
+            seq = str(row["protein_sequence"])
+            config = {
+                "version": 1,
+                "sequences": [{"protein": {"id": "A", "sequence": seq}}],
+            }
+
+        seqs = config.get("sequences", [])
+        used_ids: list[str] = []
+        for item in seqs:
+            key = next(iter(item.keys()))
+            cid = item[key]["id"]
+            if isinstance(cid, list):
+                used_ids.extend(cid)
+            else:
+                used_ids.append(cid)
+
+        ligand_id = next(
+            l for l in string.ascii_uppercase if l not in used_ids
+        )
+
+        seqs.append({"ligand": {"id": ligand_id, "smiles": row["ligand_description"]}})
+        config["sequences"] = seqs
+        properties = config.get("properties", [])
+        properties.append({"affinity": {"binder": ligand_id}})
+        config["properties"] = properties
+
+        path = tmp_root / f"{name}.yaml"
+        with path.open("w") as f:
+            yaml.safe_dump(config, f, sort_keys=False)
+        yaml_paths.append(path)
+
+    devices = [d.strip() for d in str(inference_device).split(",") if d.strip()]
+    groups = [[] for _ in devices]
+    for idx, path in enumerate(yaml_paths):
+        groups[idx % len(devices)].append(path)
+
+    procs = []
+    for device, group in zip(devices, groups):
+        if not group:
+            continue
+        data_dir = tmp_root / f"gpu_{device}"
+        data_dir.mkdir()
+        for p in group:
+            (data_dir / p.name).symlink_to(p)
+        proc = multiprocessing.Process(
+            target=_screen_worker, args=(data_dir, out_dir, device)
+        )
+        proc.start()
+        procs.append(proc)
+
+    for p in procs:
+        p.join()
+
+    results = []
+    out_path = Path(out_dir)
+    for json_file in out_path.glob("boltz_results_*/predictions/*/affinity_*.json"):
+        with json_file.open("r") as f:
+            data = json.load(f)
+        complex_name = json_file.parent.name
+        results.append({"complex_name": complex_name, **data})
+
+    if results:
+        df_out = pd.DataFrame(results)
+        df_out.to_csv(out_path / "screening_results.csv", index=False)
+
+    return
 
 
 if __name__ == "__main__":
