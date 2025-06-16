@@ -6,11 +6,13 @@ import tarfile
 import urllib.request
 import warnings
 import json
+import hashlib
 from dataclasses import asdict, dataclass
 from functools import partial
 from multiprocessing import Pool
 from pathlib import Path
 from typing import Literal, Optional
+from collections import OrderedDict
 import tempfile
 import string
 
@@ -517,17 +519,22 @@ def process_input(  # noqa: C901, PLR0912, PLR0915, D103
         target_id = target.record.id
 
         # Get all MSA ids and decide whether to generate MSA
-        to_generate = {}
+        to_generate: OrderedDict[str, str] = OrderedDict()
         prot_id = const.chain_type_ids["PROTEIN"]
+        seq_key_parts = [
+            target.sequences[c.entity_id]
+            for c in target.record.chains
+            if c.mol_type == prot_id
+        ]
+        seq_key = hashlib.md5("".join(seq_key_parts).encode()).hexdigest()
         for chain in target.record.chains:
-            # Add to generate list, assigning entity id
             if (chain.mol_type == prot_id) and (chain.msa_id == 0):
-                entity_id = chain.entity_id
-                msa_id = f"{target_id}_{entity_id}"
-                to_generate[msa_id] = target.sequences[entity_id]
-                chain.msa_id = msa_dir / f"{msa_id}.csv"
-
-            # We do not support msa generation for non-protein chains
+                seq = target.sequences[chain.entity_id]
+                name = f"{seq_key}_{hashlib.md5(seq.encode()).hexdigest()}"
+                msa_path = msa_dir / f"{name}.csv"
+                chain.msa_id = msa_path
+                if not msa_path.exists():
+                    to_generate[name] = seq
             elif chain.msa_id == 0:
                 chain.msa_id = -1
 
@@ -541,7 +548,7 @@ def process_input(  # noqa: C901, PLR0912, PLR0915, D103
             click.echo(msg)
             compute_msa(
                 data=to_generate,
-                target_id=target_id,
+                target_id=seq_key,
                 msa_dir=msa_dir,
                 msa_server_url=msa_server_url,
                 msa_pairing_strategy=msa_pairing_strategy,
@@ -558,8 +565,8 @@ def process_input(  # noqa: C901, PLR0912, PLR0915, D103
                 raise FileNotFoundError(msg)  # noqa: TRY301
 
             # Dump processed MSA
-            processed = processed_msa_dir / f"{target_id}_{msa_idx}.npz"
-            msa_id_map[msa_id] = f"{target_id}_{msa_idx}"
+            processed = processed_msa_dir / f"{seq_key}_{msa_idx}.npz"
+            msa_id_map[msa_id] = f"{seq_key}_{msa_idx}"
             if not processed.exists():
                 # Parse A3M
                 if msa_path.suffix == ".a3m":
@@ -620,7 +627,7 @@ def process_inputs(
     msa_server_url: str,
     msa_pairing_strategy: str,
     max_msa_seqs: int = 8192,
-    use_msa_server: bool = False,
+    use_msa_server: bool = True,
     boltz2: bool = False,
     preprocessing_threads: int = 1,
 ) -> Manifest:
@@ -637,7 +644,7 @@ def process_inputs(
     max_msa_seqs : int, optional
         Max number of MSA sequences, by default 4096.
     use_msa_server : bool, optional
-        Whether to use the MMSeqs2 server for MSA generation, by default False.
+        Whether to use the MMSeqs2 server for MSA generation, by default True.
     boltz2: bool, optional
         Whether to use Boltz2, by default False.
     preprocessing_threads: int, optional
@@ -846,9 +853,10 @@ def cli() -> None:
     default=None,
 )
 @click.option(
-    "--use_msa_server",
+    "--use_msa_server/--no_use_msa_server",
+    default=True,
     is_flag=True,
-    help="Whether to use the MMSeqs2 server for MSA generation. Default is False.",
+    help="Whether to use the MMSeqs2 server for MSA generation. Default is True.",
 )
 @click.option(
     "--msa_server_url",
@@ -955,7 +963,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     num_workers: int = 2,
     override: bool = False,
     seed: Optional[int] = None,
-    use_msa_server: bool = False,
+    use_msa_server: bool = True,
     msa_server_url: str = "https://api.colabfold.com",
     msa_pairing_strategy: str = "greedy",
     use_potentials: bool = False,
