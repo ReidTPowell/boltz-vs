@@ -1,30 +1,26 @@
+import hashlib
+import json
 import multiprocessing
 import os
 import pickle
 import platform
+import shutil
+import string
 import tarfile
+import tempfile
 import urllib.request
 import warnings
-import json
-
-import hashlib
-
+from collections import OrderedDict
 from dataclasses import asdict, dataclass
 from functools import partial
 from multiprocessing import Pool
 from pathlib import Path
 from typing import Literal, Optional
 
-from collections import OrderedDict
-
-import tempfile
-import string
-
-import pandas as pd
-import yaml
-
 import click
+import pandas as pd
 import torch
+import yaml
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.utilities import rank_zero_only
@@ -198,7 +194,7 @@ def download_boltz1(cache: Path) -> None:
             try:
                 urllib.request.urlretrieve(url, str(model))  # noqa: S310
                 break
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 if i == len(BOLTZ1_URL_WITH_FALLBACK) - 1:
                     msg = f"Failed to download model from all URLs. Last error: {e}"
                     raise RuntimeError(msg) from e
@@ -239,7 +235,7 @@ def download_boltz2(cache: Path) -> None:
             try:
                 urllib.request.urlretrieve(url, str(model))  # noqa: S310
                 break
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 if i == len(BOLTZ2_URL_WITH_FALLBACK) - 1:
                     msg = f"Failed to download model from all URLs. Last error: {e}"
                     raise RuntimeError(msg) from e
@@ -256,7 +252,7 @@ def download_boltz2(cache: Path) -> None:
             try:
                 urllib.request.urlretrieve(url, str(affinity_model))  # noqa: S310
                 break
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 if i == len(BOLTZ2_AFFINITY_URL_WITH_FALLBACK) - 1:
                     msg = f"Failed to download model from all URLs. Last error: {e}"
                     raise RuntimeError(msg) from e
@@ -1304,7 +1300,14 @@ def _screen_worker(data_dir: Path, out_dir: str, device: str) -> None:
     default="0",
     help="Comma separated list of GPU device indices to use for inference.",
 )
-def screen(csv_file: str, out_dir: str, inference_device: str) -> None:
+@click.option(
+    "--lite-output",
+    is_flag=True,
+    help="Only keep the concatenated CSV results, deleting intermediate files.",
+)
+def screen(
+    csv_file: str, out_dir: str, inference_device: str, lite_output: bool
+) -> None:
     """Run virtual screening from a CSV description."""
     df = pd.read_csv(csv_file)
 
@@ -1315,7 +1318,7 @@ def screen(csv_file: str, out_dir: str, inference_device: str) -> None:
         name = str(row["complex_name"])
 
         if isinstance(row.get("protein_path"), str) and row["protein_path"]:
-            with open(Path(row["protein_path"]).expanduser(), "r") as f:
+            with open(Path(row["protein_path"]).expanduser()) as f:
                 config = yaml.safe_load(f)
         else:
             seq = str(row["protein_sequence"])
@@ -1334,9 +1337,7 @@ def screen(csv_file: str, out_dir: str, inference_device: str) -> None:
             else:
                 used_ids.append(cid)
 
-        ligand_id = next(
-            l for l in string.ascii_uppercase if l not in used_ids
-        )
+        ligand_id = next(l for l in string.ascii_uppercase if l not in used_ids)
 
         seqs.append({"ligand": {"id": ligand_id, "smiles": row["ligand_description"]}})
         config["sequences"] = seqs
@@ -1383,7 +1384,11 @@ def screen(csv_file: str, out_dir: str, inference_device: str) -> None:
         df_out = pd.DataFrame(results)
         df_out.to_csv(out_path / "screening_results.csv", index=False)
 
-    return
+    if lite_output:
+        for p in out_path.glob("boltz_results_*"):
+            if p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+
 
 
 if __name__ == "__main__":
