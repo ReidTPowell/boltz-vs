@@ -60,7 +60,7 @@ Run high throughput affinity predictions from a CSV description with:
 boltz screen inputs.csv --inference-device 0,1 -o output_dir
 ```
 
-Each row in `inputs.csv` must contain `complex_name`, `protein_path` or `protein_sequence`, and `ligand_description`. Duplicate protein sequences are processed only once and reused across ligands. Results are written to `screening_results.csv` in the output directory.
+Each row in `inputs.csv` must contain `complex_name`, `protein_path` or `protein_sequence`, and `ligand_description`. Duplicate protein sequences are processed only once and reused across ligands. Results are written to `screening_results.csv` in the output directory. Pass `--lite-output` to delete intermediate prediction files and only keep the final CSV.
 
 
 ## Training
